@@ -71,6 +71,7 @@ func (n *shortNode) copy() *shortNode { copy := *n; return &copy }
 type nodeFlag struct {
 	hash  hashNode // cached hash of the node (may be nil)
 	dirty bool     // whether the node has changes that must be written to the database
+	key_prefix []byte
 }
 
 func (n *fullNode) cache() (hashNode, bool)  { return n.flags.hash, n.flags.dirty }
@@ -195,7 +196,7 @@ func decodeRef(buf []byte) (node, []byte, error) {
 	case kind == rlp.String && len(val) == 0:
 		// empty node
 		return nil, rest, nil
-	case kind == rlp.String && len(val) == 32:
+	case kind == rlp.String && (len(val) == 32 || len(val) == 37):
 		return append(hashNode{}, val...), rest, nil
 	default:
 		return nil, nil, fmt.Errorf("invalid RLP string size %d (want 0 or 32)", len(val))

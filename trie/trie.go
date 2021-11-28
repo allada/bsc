@@ -67,8 +67,11 @@ type Trie struct {
 }
 
 // newFlag returns the cache flag value for a newly created node.
-func (t *Trie) newFlag() nodeFlag {
-	return nodeFlag{dirty: true}
+func (t *Trie) newFlag(key_prefix []byte) nodeFlag {
+	return nodeFlag{
+		dirty: true,
+		key_prefix: key_prefix,
+	}
 }
 
 // New creates a trie with an existing root node from db.
@@ -85,7 +88,7 @@ func New(root common.Hash, db *Database) (*Trie, error) {
 		db: db,
 	}
 	if root != (common.Hash{}) && root != emptyRoot {
-		rootnode, err := trie.resolveHash(root[:], nil)
+		rootnode, err := trie.resolveHash(root[:], nil, []byte{})
 		if err != nil {
 			return nil, err
 		}
@@ -146,9 +149,13 @@ func (t *Trie) tryGet(origNode node, key []byte, pos int) (value []byte, newnode
 		}
 		return value, n, didResolve, err
 	case hashNode:
-		child, err := t.resolveHash(n, key[:pos])
+		child, err := t.resolveHash(n, key[:pos], to_prefix(key))
 		if err != nil {
-			return nil, n, true, err
+			// Try to find it without prefix.
+			child, err = t.resolveHash(n, key[:pos], []byte{})
+			if err != nil {
+				return nil, n, true, err
+			}
 		}
 		value, newnode, _, err := t.tryGet(child, key, pos)
 		return value, newnode, true, err
@@ -173,6 +180,24 @@ func (t *Trie) TryGetNode(path []byte) ([]byte, int, error) {
 	return item, resolved, err
 }
 
+func to_prefix(key []byte) ([]byte) {
+	if key != nil && len(key) >= 5 {
+		return key[:5]
+	}
+	return []byte{};
+}
+
+func to_join_prefix(prefix, key []byte) ([]byte) {
+	var key_prefix []byte
+	if key != nil && len(prefix) >= 5 {
+		key_prefix = prefix[:5]
+	} else if key != nil && len(prefix) + len(key) >= 5 {
+		key_prefix = append(key_prefix, prefix...)
+		key_prefix = append(key_prefix, key[len(prefix):5]...)
+	}
+	return key_prefix;
+}
+
 func (t *Trie) tryGetNode(origNode node, path []byte, pos int) (item []byte, newnode node, resolved int, err error) {
 	// If we reached the requested path, return the current node
 	if pos >= len(path) {
@@ -188,7 +213,10 @@ func (t *Trie) tryGetNode(origNode node, path []byte, pos int) (item []byte, new
 		if hash == nil {
 			return nil, origNode, 0, errors.New("non-consensus node")
 		}
-		blob, err := t.db.Node(common.BytesToHash(hash))
+
+		prefixed_hash := append(to_prefix(path), hash...)
+		
+		blob, err := t.db.Node(common.BytesToHash(prefixed_hash))
 		return blob, origNode, 1, err
 	}
 	// Path still needs to be traversed, descend into children
@@ -222,7 +250,7 @@ func (t *Trie) tryGetNode(origNode node, path []byte, pos int) (item []byte, new
 		return item, n, resolved, err
 
 	case hashNode:
-		child, err := t.resolveHash(n, path[:pos])
+		child, err := t.resolveHash(n, path[:pos], to_prefix(path))
 		if err != nil {
 			return nil, n, 1, err
 		}
@@ -280,6 +308,9 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 		}
 		return true, value, nil
 	}
+
+	key_prefix := to_join_prefix(prefix, key)
+
 	switch n := n.(type) {
 	case *shortNode:
 		matchlen := prefixLen(key, n.Key)
@@ -290,10 +321,10 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 			if !dirty || err != nil {
 				return false, n, err
 			}
-			return true, &shortNode{n.Key, nn, t.newFlag()}, nil
+			return true, &shortNode{n.Key, nn, t.newFlag(key_prefix)}, nil
 		}
 		// Otherwise branch out at the index where they differ.
-		branch := &fullNode{flags: t.newFlag()}
+		branch := &fullNode{flags: t.newFlag(key_prefix)}
 		var err error
 		_, branch.Children[n.Key[matchlen]], err = t.insert(nil, append(prefix, n.Key[:matchlen+1]...), n.Key[matchlen+1:], n.Val)
 		if err != nil {
@@ -308,7 +339,7 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 			return true, branch, nil
 		}
 		// Otherwise, replace it with a short node leading up to the branch.
-		return true, &shortNode{key[:matchlen], branch, t.newFlag()}, nil
+		return true, &shortNode{key[:matchlen], branch, t.newFlag(key_prefix)}, nil
 
 	case *fullNode:
 		dirty, nn, err := t.insert(n.Children[key[0]], append(prefix, key[0]), key[1:], value)
@@ -316,18 +347,18 @@ func (t *Trie) insert(n node, prefix, key []byte, value node) (bool, node, error
 			return false, n, err
 		}
 		n = n.copy()
-		n.flags = t.newFlag()
+		n.flags = t.newFlag(key_prefix)
 		n.Children[key[0]] = nn
 		return true, n, nil
 
 	case nil:
-		return true, &shortNode{key, value, t.newFlag()}, nil
+		return true, &shortNode{key, value, t.newFlag(key_prefix)}, nil
 
 	case hashNode:
 		// We've hit a part of the trie that isn't loaded yet. Load
 		// the node and insert into it. This leaves all child nodes on
 		// the path to the value in the trie.
-		rn, err := t.resolveHash(n, prefix)
+		rn, err := t.resolveHash(n, prefix, to_join_prefix(prefix, key))
 		if err != nil {
 			return false, nil, err
 		}
@@ -366,6 +397,13 @@ func (t *Trie) TryDelete(key []byte) error {
 // It reduces the trie to minimal form by simplifying
 // nodes on the way up after deleting recursively.
 func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
+	var key_prefix []byte
+	if len(prefix) >= 5 {
+		key_prefix = prefix[:5]
+	} else if len(prefix) + len(key) >= 5 {
+		key_prefix = append(key_prefix, prefix...)
+		key_prefix = append(key_prefix, key[len(prefix):5]...)
+	}
 	switch n := n.(type) {
 	case *shortNode:
 		matchlen := prefixLen(key, n.Key)
@@ -391,9 +429,9 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 			// always creates a new slice) instead of append to
 			// avoid modifying n.Key since it might be shared with
 			// other nodes.
-			return true, &shortNode{concat(n.Key, child.Key...), child.Val, t.newFlag()}, nil
+			return true, &shortNode{concat(n.Key, child.Key...), child.Val, t.newFlag(key_prefix)}, nil
 		default:
-			return true, &shortNode{n.Key, child, t.newFlag()}, nil
+			return true, &shortNode{n.Key, child, t.newFlag(key_prefix)}, nil
 		}
 
 	case *fullNode:
@@ -402,7 +440,7 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 			return false, n, err
 		}
 		n = n.copy()
-		n.flags = t.newFlag()
+		n.flags = t.newFlag(key_prefix)
 		n.Children[key[0]] = nn
 
 		// Check how many non-nil entries are left after deleting and
@@ -433,18 +471,18 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 				// shortNode{..., shortNode{...}}.  Since the entry
 				// might not be loaded yet, resolve it just for this
 				// check.
-				cnode, err := t.resolve(n.Children[pos], prefix)
+				cnode, err := t.resolve(n.Children[pos], prefix, key_prefix)
 				if err != nil {
 					return false, nil, err
 				}
 				if cnode, ok := cnode.(*shortNode); ok {
 					k := append([]byte{byte(pos)}, cnode.Key...)
-					return true, &shortNode{k, cnode.Val, t.newFlag()}, nil
+					return true, &shortNode{k, cnode.Val, t.newFlag(key_prefix)}, nil
 				}
 			}
 			// Otherwise, n is replaced by a one-nibble short node
 			// containing the child.
-			return true, &shortNode{[]byte{byte(pos)}, n.Children[pos], t.newFlag()}, nil
+			return true, &shortNode{[]byte{byte(pos)}, n.Children[pos], t.newFlag(key_prefix)}, nil
 		}
 		// n still contains at least two values and cannot be reduced.
 		return true, n, nil
@@ -459,7 +497,7 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 		// We've hit a part of the trie that isn't loaded yet. Load
 		// the node and delete from it. This leaves all child nodes on
 		// the path to the value in the trie.
-		rn, err := t.resolveHash(n, prefix)
+		rn, err := t.resolveHash(n, prefix, to_join_prefix(prefix, key))
 		if err != nil {
 			return false, nil, err
 		}
@@ -481,19 +519,23 @@ func concat(s1 []byte, s2 ...byte) []byte {
 	return r
 }
 
-func (t *Trie) resolve(n node, prefix []byte) (node, error) {
+func (t *Trie) resolve(n node, prefix []byte, key_prefix []byte) (node, error) {
 	if n, ok := n.(hashNode); ok {
-		return t.resolveHash(n, prefix)
+		return t.resolveHash(n, prefix, key_prefix)
 	}
 	return n, nil
 }
 
-func (t *Trie) resolveHash(n hashNode, prefix []byte) (node, error) {
-	hash := common.BytesToHash(n)
-	if node := t.db.node(hash); node != nil {
+func (t *Trie) resolveHash(n hashNode, prefix []byte, key_prefix []byte) (node, error) {
+	prefixed_hash := common.BytesToHash(append([]byte(key_prefix), n...))
+
+	if node := t.db.node(prefixed_hash); node != nil {
 		return node, nil
 	}
-	return nil, &MissingNodeError{NodeHash: hash, Path: prefix}
+	if node := t.db.node(common.BytesToHash(n)); node != nil {
+		return node, nil
+	}
+	return nil, &MissingNodeError{NodeHash: prefixed_hash, Path: prefix}
 }
 
 // Hash returns the root hash of the trie. It does not write to the

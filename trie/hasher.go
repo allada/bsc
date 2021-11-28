@@ -78,7 +78,7 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 		// We need to retain the possibly _not_ hashed node, in case it was too
 		// small to be hashed
 		if hn, ok := hashed.(hashNode); ok {
-			cached.flags.hash = hn
+			cached.flags.hash = append([]byte(cached.flags.key_prefix), hn...)
 		} else {
 			cached.flags.hash = nil
 		}
@@ -87,7 +87,7 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 		collapsed, cached := h.hashFullNodeChildren(n)
 		hashed = h.fullnodeToHash(collapsed, force)
 		if hn, ok := hashed.(hashNode); ok {
-			cached.flags.hash = hn
+			cached.flags.hash = append([]byte(cached.flags.key_prefix), hn...)
 		} else {
 			cached.flags.hash = nil
 		}

@@ -358,7 +358,7 @@ func (it *nodeIterator) resolveHash(hash hashNode, path []byte) (node, error) {
 			}
 		}
 	}
-	resolved, err := it.trie.resolveHash(hash, path)
+	resolved, err := it.trie.resolveHash(hash, path, to_prefix(path))
 	return resolved, err
 }
 
